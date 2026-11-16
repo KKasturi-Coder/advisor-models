@@ -3,9 +3,12 @@
 # one GB10 on the DGX Spark, local FP8 student. GRPO only: nothing here is for
 # the PPO arms (P, P6).
 #
-# NOT AUTHORIZED TO RUN. As of amendment A2 (13 Nov 2026) no E10 training step,
-# G1 or G2 is authorized. This script exists so the port's config can be reviewed.
-# Settings marked G1/G2 are fixed by those gates, by amendment, before any run.
+# Authorized runs (amendment A4, 16 Nov 2026), GRPO arm only, and nothing else:
+#   E10_GATE=g1  G1, memory: 1 training step   (exp-10_arm-g1smokegrpo_split-tenacitytrain_seed-0)
+#   E10_GATE=g2  G2, smoke:  3 training steps  (exp-10_arm-g2smokegrpo_split-tenacitytrain_seed-0)
+# Both need ADVISOR_VLLM_MEM set explicitly. Without E10_GATE the script still
+# refuses to run: no amendment authorizes a full E10 run. Settings marked G1/G2
+# are fixed by those gates, by amendment, before any full run.
 #
 # Print the resolved overrides without starting anything (used by the tests):
 #   E10_PRINT_OVERRIDES=1 bash scripts/e10_train_swe_smith_grpo.sh
@@ -53,14 +56,30 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DATA_DIR="${DATA_DIR:-$REPO_ROOT/data/swe_smith}"
 REPO="${REPO:-jd__tenacity}"
 RUN_NAME="${RUN_NAME:-exp-10_arm-grpolora_split-tenacitytrain_seed-0}"
+# A4 gates: a fixed setup run id and a step cap; the gate runs are not E10 arms.
+E10_GATE="${E10_GATE:-}"
+case "$E10_GATE" in
+    g1) MAX_STEPS=1; RUN_NAME=exp-10_arm-g1smokegrpo_split-tenacitytrain_seed-0 ;;
+    g2) MAX_STEPS=3; RUN_NAME=exp-10_arm-g2smokegrpo_split-tenacitytrain_seed-0 ;;
+    "") MAX_STEPS="" ;;
+    *) echo "E10_GATE must be g1 or g2 (amendment A4), got '$E10_GATE'." >&2; exit 2 ;;
+esac
 CKPT_ROOT="${CKPT_ROOT:-$HOME/e10-work/ckpts}"
 EXPORT_ROOT="${EXPORT_ROOT:-$HOME/e10-work/exports}"
 LOGGER="${LOGGER:-console}"
 # G2 fixes the step count (295 or 150) by amendment; 56 issues / batch 4 = 14 steps per epoch.
 EPOCHS="${EPOCHS:-TBD_BY_G2}"
+if [ -n "$MAX_STEPS" ]; then
+    # One epoch is 14 steps (56 issues / 4); the step cap ends the gate run early.
+    EPOCHS=1
+fi
 # G1 fixes the advisor vLLM's memory share next to the student (0.40) and the trainer.
 ADVISOR_VLLM_MEM="${ADVISOR_VLLM_MEM:-TBD_BY_G1}"
 CKPT_INTERVAL="${CKPT_INTERVAL:-28}"
+if [ -n "$MAX_STEPS" ]; then
+    # Save once, at the gate's last step, so the checkpoint and export paths are exercised.
+    CKPT_INTERVAL=$MAX_STEPS
+fi
 
 OVERRIDES=(
     data.train_data="['$DATA_DIR/train_${REPO}.json']"
@@ -122,14 +141,25 @@ OVERRIDES=(
     trainer.run_name="$RUN_NAME"
 )
 
+if [ -n "$MAX_STEPS" ]; then
+    OVERRIDES+=(trainer.max_training_steps=$MAX_STEPS)
+fi
+
 if [ "${E10_PRINT_OVERRIDES:-0}" = "1" ]; then
     printf '%s\n' "${OVERRIDES[@]}"
     exit 0
 fi
 
-echo "E10 STOP: no amendment authorizes an E10 training run yet (A2, 13 Nov 2026)." >&2
-echo "Remove this guard only in the commit that records the authorizing amendment." >&2
-exit 1
+if [ -z "$E10_GATE" ]; then
+    echo "E10 STOP: no amendment authorizes a full E10 training run yet (A4 allows E10_GATE=g1 or g2 only)." >&2
+    echo "Remove this guard only in the commit that records the authorizing amendment." >&2
+    exit 1
+fi
+if ! [[ "$ADVISOR_VLLM_MEM" =~ ^0\.[0-9]+$ ]]; then
+    echo "E10 STOP: set ADVISOR_VLLM_MEM (the advisor vLLM's memory share, e.g. 0.25) for the $E10_GATE run." >&2
+    exit 1
+fi
+echo "E10 $E10_GATE (amendment A4): $RUN_NAME, $MAX_STEPS step(s), advisor vLLM memory $ADVISOR_VLLM_MEM" >&2
 
 # Environment the run will need (agent and eval servers on the Spark, local student):
 #   AGENT_SERVER_URL=http://localhost:8081 EVAL_SERVER_URL=http://localhost:8082
