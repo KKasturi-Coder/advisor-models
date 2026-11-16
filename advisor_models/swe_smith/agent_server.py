@@ -22,6 +22,7 @@ Requirements:
 
 import argparse
 import logging
+import re
 import uuid
 import time
 import threading
@@ -41,6 +42,7 @@ from minisweagent.agents.default import DefaultAgent, AgentConfig, TerminatingEx
 from minisweagent.models.litellm_model import LitellmModel  # noqa: E402
 from minisweagent.environments.docker import DockerEnvironment  # noqa: E402
 
+from .features import FeatureTracker, diff_hash  # noqa: E402
 from .images import resolve_image_name  # noqa: E402
 
 logging.basicConfig(
@@ -50,6 +52,9 @@ logger = logging.getLogger(__name__)
 
 # Fail a session that has made no successful model call after this many steps.
 NO_CALL_ABORT_STEPS = 3
+
+# mini-swe-agent's action format (DefaultAgent.parse_action).
+_BASH_BLOCK = re.compile(r"```bash\s*\n(.*?)\n```", re.DOTALL)
 
 app = Flask(__name__)
 
@@ -92,6 +97,8 @@ class AgentSession:
         self.total_steps = 0
         self.error = None
         self.step_counter = 0
+        # E10's six-feature state (spec §3.1), updated after every student step.
+        self.features = FeatureTracker()
 
         self.docker_env: Optional[DockerEnvironment] = None
         self.agent: Optional[DefaultAgent] = None
@@ -263,9 +270,11 @@ class AgentSession:
                     self.terminated = True
                     break
 
+                n_messages = len(self.agent.messages)
                 try:
                     self.total_steps += 1
-                    self.agent.step()
+                    output = self.agent.step()
+                    self._record_features(n_messages, output)
                 except TerminatingException as e:
                     logger.info(f"Session {self.session_id} terminated by agent: {e}")
                     self.terminated = True
@@ -281,6 +290,12 @@ class AgentSession:
 
                     error_msg = self._clean_error_message(e)
                     last_error_msg = error_msg
+                    # A timed-out command ran and counts as failed; any other
+                    # error (format error, failed model call) ran no command.
+                    timed_out = type(e).__name__ == "ExecutionTimeoutError"
+                    self._record_features(
+                        n_messages, {"returncode": None, "output": None} if timed_out else None
+                    )
                     self.agent.add_message("user", error_msg)
 
                 # A dead key, empty balance, or unpriced model raises on every
@@ -313,6 +328,10 @@ class AgentSession:
             }
             if self.error:
                 response["error"] = self.error
+            if not self.terminated:
+                # Features for the next advice turn, before it is generated.
+                # Turn 0's are fixed (no step taken yet) and computed by the env.
+                response["features"] = self.features.snapshot(advice_turn=self.step_counter)
             return response
 
         except Exception as e:
@@ -346,6 +365,49 @@ class AgentSession:
         )
 
         return observation_text
+
+    def _record_features(self, n_messages: int, output: Optional[Dict[str, Any]]) -> None:
+        """Update the E10 feature tracker after one student step.
+
+        Args:
+            n_messages: len(self.agent.messages) before the step, to find the
+                command the student wrote in this step.
+            output: the executed command's {"output", "returncode"}, or None if
+                the step ran no command.
+        """
+        try:
+            command = None
+            if output is not None:
+                for message in self.agent.messages[n_messages:]:
+                    if message.get("role") == "assistant":
+                        actions = _BASH_BLOCK.findall(message.get("content") or "")
+                        if len(actions) == 1:
+                            command = actions[0].strip()
+                        break
+            self.features.record_step(
+                command,
+                output.get("returncode") if output else None,
+                output.get("output") if output else None,
+                self._diff_hash(),
+            )
+        except Exception as e:
+            # Features are recorded for analysis only; never fail the session.
+            logger.warning(f"Session {self.session_id}: feature update failed: {e}")
+
+    def _diff_hash(self) -> Optional[str]:
+        """Hash of the working-tree diff (same command as get_patch); None if unreadable."""
+        if not self.docker_env or not self.original_commit:
+            return None
+        try:
+            result = self.docker_env.execute(
+                f"git diff {self.original_commit}",
+                cwd=self.repo_dir_in_container,
+            )
+        except Exception:
+            return None
+        if result.get("returncode") != 0:
+            return None
+        return diff_hash(result["output"])
 
     def _clean_error_message(self, error: Exception, max_length: int = 300) -> str:
         """Clean and truncate error messages."""

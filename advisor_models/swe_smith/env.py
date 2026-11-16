@@ -19,6 +19,7 @@ from skyrl_gym.envs.base_text_env import BaseTextEnv, BaseTextEnvStepOutput
 
 from .remote_agent_client import RemoteAgentClient
 from .config import compute_score
+from .features import FeatureTracker
 from .reward import e7_reward
 
 
@@ -67,6 +68,10 @@ class SWESmithEnv(BaseTextEnv):
         # Rolling summary state (maintained by remote agent)
         self.rolling_summary = ""
         self.last_summarized_step = 0
+
+        # E10 six-feature state (spec §3.1), one entry per advice turn, each
+        # taken before that turn's advice. Turn 0 comes before any student step.
+        self.turn_features = [FeatureTracker().snapshot(advice_turn=0)]
 
     def init(
         self, prompt: List[Dict[str, str]]
@@ -132,6 +137,8 @@ class SWESmithEnv(BaseTextEnv):
                 self.agent_terminated = True
 
             self.total_steps_taken = result.get("total_steps", 0)
+            if result.get("features") is not None:
+                self.turn_features.append(result["features"])
 
             # Update rolling summary from remote
             self.rolling_summary = result.get("rolling_summary", "")
@@ -169,6 +176,7 @@ class SWESmithEnv(BaseTextEnv):
             "ground_truth": "",
             "final_reward": 0.0,
             "other_info": f"In-progress: Steps: {self.total_steps_taken}, Instance ID: {self.ground_truth['instance_id']}, Remote session ID: {self.session_id}",
+            "e10_features": self.turn_features[-1],
         }
 
         self.previous_observation = observation_text
