@@ -77,9 +77,10 @@ def adapter_off_policy_worker():
 
     class E10FSDPPolicyWorker(FSDPPolicyWorkerBase):
         def forward(self, data, loss_fn=None, loss_fn_config=None, return_per_token_outputs=True,
-                    reference=False):
+                    reference=False, **extra):
+            # **extra passes through what Ray adds to actor methods (e.g. _ray_trace_ctx).
             kwargs = dict(loss_fn=loss_fn, loss_fn_config=loss_fn_config,
-                          return_per_token_outputs=return_per_token_outputs)
+                          return_per_token_outputs=return_per_token_outputs, **extra)
             if not reference:
                 return super().forward(data, **kwargs)
             peft_model = self.model.model  # HFModelWrapper -> PeftModel when LoRA is on
