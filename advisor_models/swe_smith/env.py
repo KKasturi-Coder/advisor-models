@@ -16,23 +16,23 @@ import json
 import os
 
 from skyrl_gym.envs.base_text_env import BaseTextEnv, BaseTextEnvStepOutput
-from omegaconf import DictConfig
 
 from .remote_agent_client import RemoteAgentClient
 from .config import compute_score
-
-LENGTH_COEFFICIENT = 0.5
-MAX_STEPS = 40
+from . import trajectories
+from .features import FeatureTracker
+from .reward import e7_reward
 
 
 class SWESmithEnv(BaseTextEnv):
     """Environment for SWE-Smith with remote agent execution."""
 
-    def __init__(self, env_config: DictConfig, extras: Dict[str, Any] = {}):
+    def __init__(self, env_config: Any = None, extras: Dict[str, Any] = {}):
         """Initialize the environment.
 
         Args:
-            env_config: The environment configuration
+            env_config: The environment configuration (unused). E7's SkyRL fork
+                passes an omegaconf DictConfig, upstream SkyRL a dict.
             extras: Additional metadata including:
                 - reward_spec: Contains ground_truth instance
                 - original_question: Problem statement
@@ -70,6 +70,17 @@ class SWESmithEnv(BaseTextEnv):
         self.rolling_summary = ""
         self.last_summarized_step = 0
 
+        # E10 six-feature state (spec §3.1), one entry per advice turn, each
+        # taken before that turn's advice. Turn 0 comes before any student step.
+        self.turn_features = [FeatureTracker().snapshot(advice_turn=0)]
+
+        # E10 saved trajectories (spec §6): this rollout's key, set by the E10
+        # generator, and its result, reported once when the rollout ends.
+        self.trajectory_key = extras.get(trajectories.EXTRAS_KEY)
+        self.e10_session_id = None
+        self.e10_result = {"outcome": None, "resolved": None, "env_reward": None, "test_report": None}
+        self.e10_reported = False
+
     def init(
         self, prompt: List[Dict[str, str]]
     ) -> Tuple[List[Dict[str, str]], Dict[str, Any]]:
@@ -90,6 +101,7 @@ class SWESmithEnv(BaseTextEnv):
             self.session_id = self.remote_agent.create_session(
                 self.ground_truth, model_name=self.agent_model
             )
+            self.e10_session_id = self.session_id
         except Exception as e:
             print(f"Error creating remote session: {e}")
             import traceback
@@ -134,6 +146,8 @@ class SWESmithEnv(BaseTextEnv):
                 self.agent_terminated = True
 
             self.total_steps_taken = result.get("total_steps", 0)
+            if result.get("features") is not None:
+                self.turn_features.append(result["features"])
 
             # Update rolling summary from remote
             self.rolling_summary = result.get("rolling_summary", "")
@@ -171,6 +185,7 @@ class SWESmithEnv(BaseTextEnv):
             "ground_truth": "",
             "final_reward": 0.0,
             "other_info": f"In-progress: Steps: {self.total_steps_taken}, Instance ID: {self.ground_truth['instance_id']}, Remote session ID: {self.session_id}",
+            "e10_features": self.turn_features[-1],
         }
 
         self.previous_observation = observation_text
@@ -189,13 +204,13 @@ class SWESmithEnv(BaseTextEnv):
             patch = self.remote_agent.get_patch(self.session_id)
 
             # Evaluate patch
-            reward, eval_id, _ = compute_score(patch, self.ground_truth)
-            if reward == 1.0:
-                reward = (1 - LENGTH_COEFFICIENT) + LENGTH_COEFFICIENT * (
-                    MAX_STEPS - self.total_steps_taken
-                ) / MAX_STEPS
+            score, eval_id, test_report = compute_score(patch, self.ground_truth)
+            reward = e7_reward(score, self.total_steps_taken)
             print(f"Reward: {reward}")
             sys.stdout.flush()
+            self.e10_result = {"outcome": "completed", "resolved": score > 0, "env_reward": reward,
+                               "test_report": test_report}
+            self._report_trajectory()
 
             # Combine evaluation info with agent stats for logging
             other_info = f"COMPLETED: Steps: {self.total_steps_taken}, Instance ID: {self.ground_truth['instance_id']}, Remote session ID: {self.session_id}, Eval ID: {eval_id}"
@@ -241,6 +256,10 @@ class SWESmithEnv(BaseTextEnv):
         }
 
         self._cleanup()
+        if self.e10_result["outcome"] is None:
+            self.e10_result = {"outcome": "failed", "resolved": False, "env_reward": 0.0,
+                               "test_report": None}
+        self._report_trajectory()
 
         return BaseTextEnvStepOutput(
             observations=[],
@@ -248,6 +267,30 @@ class SWESmithEnv(BaseTextEnv):
             done=True,
             metadata=metadata,
         )
+
+    def _report_trajectory(self):
+        """Give this rollout's env data to the E10 trajectory writer, once.
+
+        A rollout the trainer ends before the env does (e.g. the advisor's
+        input hits its length cap) reports at close() with outcome "cut".
+        """
+        if self.e10_reported or self.trajectory_key is None:
+            return
+        self.e10_reported = True
+        trajectories.record_env(self.trajectory_key, {
+            "issue_id": self.ground_truth.get("instance_id"),
+            "session_id": self.e10_session_id,
+            "turn_features": self.turn_features,
+            "student_steps": self.total_steps_taken,
+            **self.e10_result,
+        })
+
+    def close(self):
+        if self.e10_result["outcome"] is None:
+            self.e10_result = {"outcome": "cut", "resolved": None, "env_reward": None, "test_report": None}
+        self._report_trajectory()
+        self._cleanup()
+        super().close()
 
     def _cleanup(self):
         """Cleanup remote session."""
