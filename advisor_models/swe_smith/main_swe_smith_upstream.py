@@ -21,11 +21,28 @@ from skyrl_gym.envs import register
 
 
 class E10SWESmithExp(BasePPOExp):
-    """Upstream's experiment with the E10 generator (per-step rollout counts).
+    """Upstream's experiment with the E10 generator and trainer.
 
-    The generator adds metrics and a log line only; generation and rewards are
-    upstream's (see generator_upstream.py).
+    The generator adds metrics and a log line (per-step rollout counts), and
+    with the trainer it saves every training rollout (spec §6, see
+    trainer_upstream.py). Generation, rewards and training are upstream's.
     """
+
+    def get_trainer(self, cfg, tracker, tokenizer, train_dataset, eval_dataset,
+                    inference_engine_client, generator, colocate_pg):
+        from .trainer_upstream import E10RayPPOTrainer, E10TrajectoryWriter
+
+        return E10RayPPOTrainer(
+            cfg=cfg,
+            tracker=tracker,
+            tokenizer=tokenizer,
+            train_dataset=train_dataset,
+            eval_dataset=eval_dataset,
+            inference_engine_client=inference_engine_client,
+            generator=generator,
+            colocate_pg=colocate_pg,
+            callbacks=[E10TrajectoryWriter(cfg)],
+        )
 
     def get_generator(self, cfg, tokenizer, inference_engine_client):
         if cfg.generator.vision_language_generator:

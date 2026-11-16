@@ -15,15 +15,20 @@ and logs one line, ``E10 rollouts: n=.. length=.. not_stop=.. rewarded=.. zeroed
 
 The counts are taken inside ``_zero_reward_if_not_stop``, where upstream holds
 the raw rewards and the final stop reasons together, before it zeroes them.
+
+For the saved trajectories (spec §6, trajectories.py), it also tells each env
+its trajectory key, and after a training batch records each rollout's token
+ids, loss mask, stop reason and reward, and the batch's row order.
 """
 
 import contextvars
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 from loguru import logger
 from skyrl.train.generators.base import GeneratorInput, GeneratorOutput
 from skyrl.train.generators.skyrl_gym_generator import SkyRLGymGenerator
 
+from . import trajectories
 from .rollout_counts import as_metrics, count_rollouts, log_line
 
 # One box per generate() call, so concurrent calls cannot mix their counts.
@@ -54,7 +59,38 @@ class E10SkyRLGymGenerator(SkyRLGymGenerator):
         metrics.update(as_metrics(counts))
         output["rollout_metrics"] = metrics
         logger.info(log_line(counts))
+        self._record_trajectories(input_batch, output)
         return output
+
+    def _setup_env_extras(self, env_class, env_extras, sampling_params, trajectory_id):
+        env_extras = super()._setup_env_extras(env_class, env_extras, sampling_params, trajectory_id)
+        if trajectory_id is not None:
+            env_extras[trajectories.EXTRAS_KEY] = trajectory_id.to_string()
+        return env_extras
+
+    @staticmethod
+    def _record_trajectories(input_batch: GeneratorInput, output: GeneratorOutput) -> None:
+        """Training batches only: per-rollout data for the step's trajectory records."""
+        metadata: Any = input_batch.get("batch_metadata")
+        if metadata is None or str(getattr(metadata, "training_phase", "")) != "train":
+            return
+        ids = input_batch.get("trajectory_ids")
+        if not ids or len(ids) != len(output["response_ids"]):
+            raise RuntimeError("E10 trajectories: expected one trajectory id per rollout")
+        keys = [tid.to_string() for tid in ids]
+        for i, key in enumerate(keys):
+            response_ids = output["response_ids"][i]
+            loss_mask = output["loss_masks"][i][-len(response_ids):] if response_ids else []
+            reward = output["rewards"][i]
+            trajectories.record_generation(
+                key,
+                prompt_ids=output["prompt_token_ids"][i],
+                response_ids=response_ids,
+                loss_mask=loss_mask,
+                stop_reason=output["stop_reasons"][i],
+                reward=sum(reward) if isinstance(reward, list) else reward,
+            )
+        trajectories.REGISTRY.set_order(keys)
 
     def _zero_reward_if_not_stop(self, rewards: List, stop_reasons: List[str]) -> List:
         box = _counts_box.get()

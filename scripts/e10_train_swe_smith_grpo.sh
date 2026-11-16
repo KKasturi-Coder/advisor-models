@@ -136,5 +136,10 @@ exit 1
 #   AGENT_MODEL=hosted_vllm/student HOSTED_VLLM_API_BASE=http://localhost:8100/v1
 #   LITELLM_MODEL_REGISTRY_PATH=$REPO_ROOT/configs/litellm_local_student_registry.json
 #   SWESMITH_IMAGE_OVERRIDE=hecate/swesmith.arm64.jd_1776_tenacity.0d40e76f:e10
+#   E10_AGENT_LOG_DIR=<the agent server's --log-dir>, so each rollout's session
+#     log is copied beside its trajectory records (spec §6)
+# Saved trajectories (spec §6): <E10_RUN_DIR>/trajectories/step-<NNNN>.jsonl.gz
+export E10_RUN_DIR="${E10_RUN_DIR:-$EXPORT_ROOT/$RUN_NAME}"
+export E10_RUN_ID="${E10_RUN_ID:-$RUN_NAME}"
 cd "$REPO_ROOT"
 python -m advisor_models.swe_smith.main_swe_smith_upstream "${OVERRIDES[@]}" "$@"
